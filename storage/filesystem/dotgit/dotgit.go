@@ -75,8 +75,9 @@ type Options struct {
 // The DotGit type represents a local git repository on disk. This
 // type is not zero-value-safe, use the New function to initialize it.
 type DotGit struct {
-	options Options
-	fs      billy.Filesystem
+	options  Options
+	fs       billy.Filesystem
+	commonfs billy.Filesystem
 
 	// incoming object directory information
 	incomingChecked bool
@@ -93,16 +94,17 @@ type DotGit struct {
 // New returns a DotGit value ready to be used. The path argument must
 // be the absolute path of a git repository directory (e.g.
 // "/foo/bar/.git").
-func New(fs billy.Filesystem) *DotGit {
-	return NewWithOptions(fs, Options{})
+func New(fs, commonfs billy.Filesystem) *DotGit {
+	return NewWithOptions(fs, commonfs, Options{})
 }
 
 // NewWithOptions sets non default configuration options.
 // See New for complete help.
-func NewWithOptions(fs billy.Filesystem, o Options) *DotGit {
+func NewWithOptions(fs, commonfs billy.Filesystem, o Options) *DotGit {
 	return &DotGit{
-		options: o,
-		fs:      fs,
+		options:  o,
+		fs:       fs,
+		commonfs: commonfs,
 	}
 }
 
@@ -162,6 +164,13 @@ func (d *DotGit) ConfigWriter() (billy.File, error) {
 
 // Config returns a file pointer for read to the config file
 func (d *DotGit) Config() (billy.File, error) {
+	if d.commonfs != nil {
+		if _, err := d.fs.Stat(configPath); os.IsNotExist(err) {
+			return d.commonfs.Open(configPath)
+		} else if err != nil {
+			return nil, fmt.Errorf("error accessing %s: %s", d.fs.Join(d.fs.Root(), configPath), err)
+		}
+	}
 	return d.fs.Open(configPath)
 }
 
@@ -215,15 +224,29 @@ func (d *DotGit) ObjectPacks() ([]plumbing.Hash, error) {
 	return d.packList, nil
 }
 
-func (d *DotGit) objectPacks() ([]plumbing.Hash, error) {
-	packDir := d.fs.Join(objectsPath, packPath)
-	files, err := d.fs.ReadDir(packDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+func (d *DotGit) objectsFs() (billy.Filesystem, error) {
+	if d.commonfs != nil {
+		if _, err := d.commonfs.Stat(objectsPath); os.IsNotExist(err) {
+			return d.fs, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("error accessing %s: %s", d.commonfs.Join(d.commonfs.Root(), objectsPath), err)
+		} else {
+			return d.commonfs.Chroot(objectsPath)
 		}
+	} else {
+		return d.fs.Chroot(objectsPath)
+	}
+}
 
+func (d *DotGit) objectPacks() ([]plumbing.Hash, error) {
+	objectsFs, err := d.objectsFs()
+	if err != nil {
 		return nil, err
+	}
+
+	files, err := objectsFs.ReadDir(packPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading %s: %s", objectsFs.Join(objectsFs.Root(), packPath), err)
 	}
 
 	var packs []plumbing.Hash
@@ -244,8 +267,8 @@ func (d *DotGit) objectPacks() ([]plumbing.Hash, error) {
 	return packs, nil
 }
 
-func (d *DotGit) objectPackPath(hash plumbing.Hash, extension string) string {
-	return d.fs.Join(objectsPath, packPath, fmt.Sprintf("pack-%s.%s", hash.String(), extension))
+func (d *DotGit) objectPackFileName(hash plumbing.Hash, extension string) string {
+	return fmt.Sprintf("pack-%s.%s", hash.String(), extension)
 }
 
 func (d *DotGit) objectPackOpen(hash plumbing.Hash, extension string) (billy.File, error) {
@@ -265,8 +288,12 @@ func (d *DotGit) objectPackOpen(hash plumbing.Hash, extension string) (billy.Fil
 		return nil, err
 	}
 
-	path := d.objectPackPath(hash, extension)
-	pack, err := d.fs.Open(path)
+	objectsFs, err := d.objectsFs()
+	if err != nil {
+		return nil, err
+	}
+
+	pack, err := objectsFs.Open(objectsFs.Join(packPath, d.objectPackFileName(hash, extension)))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrPackfileNotFound
@@ -305,9 +332,14 @@ func (d *DotGit) ObjectPackIdx(hash plumbing.Hash) (billy.File, error) {
 func (d *DotGit) DeleteOldObjectPackAndIndex(hash plumbing.Hash, t time.Time) error {
 	d.cleanPackList()
 
-	path := d.objectPackPath(hash, `pack`)
+	objectsFs, err := d.objectsFs()
+	if err != nil {
+		return err
+	}
+
+	path := objectsFs.Join(packPath, d.objectPackFileName(hash, `pack`))
 	if !t.IsZero() {
-		fi, err := d.fs.Stat(path)
+		fi, err := objectsFs.Stat(path)
 		if err != nil {
 			return err
 		}
@@ -316,11 +348,10 @@ func (d *DotGit) DeleteOldObjectPackAndIndex(hash plumbing.Hash, t time.Time) er
 			return nil
 		}
 	}
-	err := d.fs.Remove(path)
-	if err != nil {
+	if err := objectsFs.Remove(path); err != nil {
 		return err
 	}
-	return d.fs.Remove(d.objectPackPath(hash, `idx`))
+	return objectsFs.Remove(objectsFs.Join(packPath, d.objectPackFileName(hash, `idx`)))
 }
 
 // NewObject return a writer for a new object file.
@@ -937,13 +968,22 @@ func (d *DotGit) readReferenceFile(path, name string) (ref *plumbing.Reference, 
 		return nil, ErrIsDir
 	}
 
-	f, err := d.fs.Open(path)
+	f, err := d.fsFromRefPath(path).Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer ioutil.CheckClose(f, &err)
 
 	return d.readReferenceFrom(f, name)
+}
+
+func (d *DotGit) fsFromRefPath(path string) billy.Filesystem {
+	// In general, all pseudo refs are per working tree and all refs starting
+	// with "refs/" are shared.
+	if d.commonfs != nil && strings.HasPrefix(path, "refs/") {
+		return d.commonfs
+	}
+	return d.fs
 }
 
 func (d *DotGit) CountLooseRefs() (int, error) {
@@ -1072,7 +1112,7 @@ func (d *DotGit) Alternates() ([]*DotGit, error) {
 			path = filepath.Join(d.fs.Root(), normalPath)
 		}
 		fs := osfs.New(filepath.Dir(path))
-		alternates = append(alternates, New(fs))
+		alternates = append(alternates, New(fs, d.commonfs))
 	}
 
 	if err = scanner.Err(); err != nil {
